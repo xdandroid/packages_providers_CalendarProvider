@@ -32,7 +32,6 @@ import android.text.format.Time;
 import android.util.Log;
 
 import com.google.android.collect.Maps;
-import com.google.android.googlelogin.GoogleLoginServiceConstants;
 
 import java.util.HashSet;
 import java.util.Map;
@@ -43,7 +42,7 @@ public class CalendarSyncTestingBase extends SyncBaseInstrumentation {
     protected Context mTargetContext;
     protected String mAccount;
     protected ContentResolver mResolver;
-    protected Uri mEventsUri = Uri.parse("content://calendar/events");
+    protected Uri mEventsUri = Calendar.Events.CONTENT_URI;
 
     static final String TAG = "calendar";
     static final String DEFAULT_TIMEZONE = "America/Los_Angeles";
@@ -56,14 +55,14 @@ public class CalendarSyncTestingBase extends SyncBaseInstrumentation {
         EVENT_COLUMNS_TO_SKIP.add(Calendar.Events._ID);
         EVENT_COLUMNS_TO_SKIP.add(Calendar.Events._SYNC_TIME);
         EVENT_COLUMNS_TO_SKIP.add(Calendar.Events._SYNC_VERSION);
-        EVENT_COLUMNS_TO_SKIP.add(Calendar.Events._SYNC_LOCAL_ID);
+        EVENT_COLUMNS_TO_SKIP.add(Calendar.Events._SYNC_DATA);
         EVENT_COLUMNS_TO_SKIP.add(Calendar.Events._SYNC_DIRTY);
         EVENT_COLUMNS_TO_SKIP.add(Calendar.Events._SYNC_MARK);
         ATTENDEES_COLUMNS_TO_SKIP.add(Calendar.Attendees._ID);
         CALENDARS_COLUMNS_TO_SKIP.add(Calendar.Calendars._ID);
         CALENDARS_COLUMNS_TO_SKIP.add(Calendar.Calendars._SYNC_TIME);
         CALENDARS_COLUMNS_TO_SKIP.add(Calendar.Calendars._SYNC_VERSION);
-        CALENDARS_COLUMNS_TO_SKIP.add(Calendar.Calendars._SYNC_LOCAL_ID);
+        CALENDARS_COLUMNS_TO_SKIP.add(Calendar.Calendars._SYNC_DATA);
         CALENDARS_COLUMNS_TO_SKIP.add(Calendar.Calendars._SYNC_DIRTY);
         CALENDARS_COLUMNS_TO_SKIP.add(Calendar.Calendars._SYNC_MARK);
         INSTANCES_COLUMNS_TO_SKIP.add(Calendar.Instances._ID);
@@ -350,8 +349,7 @@ public class CalendarSyncTestingBase extends SyncBaseInstrumentation {
      * @return
      */
     protected String getAccount() {
-        Account[] accounts = mAccountManager.getAccountsByType(
-                GoogleLoginServiceConstants.ACCOUNT_TYPE);
+        Account[] accounts = mAccountManager.getAccountsByType("com.google");
 
         assertTrue("Didn't find any Google accounts", accounts.length > 0);
 

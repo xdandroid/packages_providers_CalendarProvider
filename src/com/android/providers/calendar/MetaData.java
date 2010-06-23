@@ -41,15 +41,13 @@ public class MetaData {
         public String timezone;     // local timezone used for Instance expansion
         public long minInstance;    // UTC millis
         public long maxInstance;    // UTC millis
-        public int minBusyBit;      // Julian start day
-        public int maxBusyBit;      // Julian end day
     }
-    
+
     /**
      * The cached copy of the meta-data fields from the database.
      */
     private Fields mFields = new Fields();
-    
+
     private final SQLiteOpenHelper mOpenHelper;
     private boolean mInitialized;
 
@@ -60,24 +58,20 @@ public class MetaData {
     private static final String[] sCalendarMetaDataProjection = {
         CalendarMetaData.LOCAL_TIMEZONE,
         CalendarMetaData.MIN_INSTANCE,
-        CalendarMetaData.MAX_INSTANCE,
-        CalendarMetaData.MIN_BUSYBITS,
-        CalendarMetaData.MAX_BUSYBITS };
-    
+        CalendarMetaData.MAX_INSTANCE};
+
     private static final int METADATA_INDEX_LOCAL_TIMEZONE = 0;
     private static final int METADATA_INDEX_MIN_INSTANCE = 1;
     private static final int METADATA_INDEX_MAX_INSTANCE = 2;
-    private static final int METADATA_INDEX_MIN_BUSYBIT = 3;
-    private static final int METADATA_INDEX_MAX_BUSYBIT = 4;
-    
+
     public MetaData(SQLiteOpenHelper openHelper) {
         mOpenHelper = openHelper;
     }
-    
+
     /**
      * Returns a copy of all the MetaData fields.  This method grabs a
      * database lock to read all the fields atomically.
-     * 
+     *
      * @return a copy of all the MetaData fields.
      */
     public Fields getFields() {
@@ -93,8 +87,6 @@ public class MetaData {
             fields.timezone = mFields.timezone;
             fields.minInstance = mFields.minInstance;
             fields.maxInstance = mFields.maxInstance;
-            fields.minBusyBit = mFields.minBusyBit;
-            fields.maxBusyBit = mFields.maxBusyBit;
             db.setTransactionSuccessful();
         } finally {
             db.endTransaction();
@@ -104,12 +96,12 @@ public class MetaData {
 
     /**
      * This method must be called only while holding a database lock.
-     * 
+     *
      * <p>
      * Returns a copy of all the MetaData fields.  This method assumes
      * the database lock has already been acquired.
      * </p>
-     * 
+     *
      * @return a copy of all the MetaData fields.
      */
     public Fields getFieldsLocked() {
@@ -124,11 +116,9 @@ public class MetaData {
         fields.timezone = mFields.timezone;
         fields.minInstance = mFields.minInstance;
         fields.maxInstance = mFields.maxInstance;
-        fields.minBusyBit = mFields.minBusyBit;
-        fields.maxBusyBit = mFields.maxBusyBit;
         return fields;
     }
-    
+
     /**
      * Reads the meta-data for the CalendarProvider from the database and
      * updates the member variables.  This method executes while the database
@@ -138,7 +128,6 @@ public class MetaData {
     private void readLocked(SQLiteDatabase db) {
         String timezone = null;
         long minInstance = 0, maxInstance = 0;
-        int minBusyBit = 0, maxBusyBit = 0;
 
         // Read the database directly.  We only do this once to initialize
         // the members of this class.
@@ -149,8 +138,6 @@ public class MetaData {
                 timezone = cursor.getString(METADATA_INDEX_LOCAL_TIMEZONE);
                 minInstance = cursor.getLong(METADATA_INDEX_MIN_INSTANCE);
                 maxInstance = cursor.getLong(METADATA_INDEX_MAX_INSTANCE);
-                minBusyBit = cursor.getInt(METADATA_INDEX_MIN_BUSYBIT);
-                maxBusyBit = cursor.getInt(METADATA_INDEX_MAX_BUSYBIT);
             }
         } finally {
             if (cursor != null) {
@@ -162,9 +149,7 @@ public class MetaData {
         mFields.timezone = timezone;
         mFields.minInstance = minInstance;
         mFields.maxInstance = maxInstance;
-        mFields.minBusyBit = minBusyBit;
-        mFields.maxBusyBit = maxBusyBit;
-        
+
         // Mark the fields as initialized
         mInitialized = true;
     }
@@ -173,7 +158,7 @@ public class MetaData {
      * Writes the meta-data for the CalendarProvider.  The values to write are
      * passed in as parameters.  All of the values are updated atomically,
      * including the cached copy of the meta-data.
-     * 
+     *
      * @param timezone the local timezone used for Instance expansion
      * @param begin the start of the Instance expansion in UTC milliseconds
      * @param end the end of the Instance expansion in UTC milliseconds
@@ -184,7 +169,7 @@ public class MetaData {
         SQLiteDatabase db = mOpenHelper.getReadableDatabase();
         db.beginTransaction();
         try {
-            writeLocked(timezone, begin, end, startDay, endDay);
+            writeLocked(timezone, begin, end);
             db.setTransactionSuccessful();
         } finally {
             db.endTransaction();
@@ -193,27 +178,23 @@ public class MetaData {
 
     /**
      * This method must be called only while holding a database lock.
-     * 
+     *
      * <p>
      * Writes the meta-data for the CalendarProvider.  The values to write are
      * passed in as parameters.  All of the values are updated atomically,
      * including the cached copy of the meta-data.
      * </p>
-     * 
+     *
      * @param timezone the local timezone used for Instance expansion
      * @param begin the start of the Instance expansion in UTC milliseconds
      * @param end the end of the Instance expansion in UTC milliseconds
-     * @param startDay the start of the BusyBit expansion (the start Julian day)
-     * @param endDay the end of the BusyBit expansion (the end Julian day)
      */
-    public void writeLocked(String timezone, long begin, long end, int startDay, int endDay) {
+    public void writeLocked(String timezone, long begin, long end) {
         ContentValues values = new ContentValues();
         values.put("_id", 1);
         values.put(CalendarMetaData.LOCAL_TIMEZONE, timezone);
         values.put(CalendarMetaData.MIN_INSTANCE, begin);
         values.put(CalendarMetaData.MAX_INSTANCE, end);
-        values.put(CalendarMetaData.MIN_BUSYBITS, startDay);
-        values.put(CalendarMetaData.MAX_BUSYBITS, endDay);
 
         // Atomically update the database and the cached members.
         try {
@@ -223,7 +204,6 @@ public class MetaData {
             // Failed: zero the in-memory fields to force recomputation.
             mFields.timezone = null;
             mFields.minInstance = mFields.maxInstance = 0;
-            mFields.minBusyBit = mFields.maxBusyBit = 0;
             throw e;
         }
 
@@ -231,15 +211,13 @@ public class MetaData {
         mFields.timezone = timezone;
         mFields.minInstance = begin;
         mFields.maxInstance = end;
-        mFields.minBusyBit = startDay;
-        mFields.maxBusyBit = endDay;
     }
 
     /**
      * Clears the time range for the Instances table.  The rows in the
      * Instances table will be deleted (and regenerated) the next time
      * that the Instances table is queried.
-     * 
+     *
      * Also clears the time range for the BusyBits table because that depends
      * on the Instances table.
      */
@@ -252,28 +230,7 @@ public class MetaData {
             if (!mInitialized) {
                 readLocked(db);
             }
-            writeLocked(mFields.timezone, 0 /* begin */, 0 /* end */,
-                    0 /* startDay */, 0 /* endDay */);
-            db.setTransactionSuccessful();
-        } finally {
-            db.endTransaction();
-        }
-    }
-
-    /**
-     * Clears the time range for the BusyBits table.
-     */
-    public void clearBusyBitRange() {
-        SQLiteDatabase db = mOpenHelper.getReadableDatabase();
-        db.beginTransaction();
-        try {
-            // If the fields have not been initialized from the database,
-            // then read the database.
-            if (!mInitialized) {
-                readLocked(db);
-            }
-            writeLocked(mFields.timezone, mFields.minInstance, mFields.maxInstance,
-                    0 /* startDay */, 0 /* endDay */);
+            writeLocked(mFields.timezone, 0 /* begin */, 0 /* end */);
             db.setTransactionSuccessful();
         } finally {
             db.endTransaction();
