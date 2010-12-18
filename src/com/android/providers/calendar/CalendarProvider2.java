@@ -17,6 +17,8 @@
 
 package com.android.providers.calendar;
 
+import com.google.common.annotations.VisibleForTesting;
+
 import android.accounts.Account;
 import android.accounts.AccountManager;
 import android.accounts.OnAccountsUpdateListener;
@@ -51,16 +53,15 @@ import android.provider.Calendar.Reminders;
 import android.text.TextUtils;
 import android.text.format.DateUtils;
 import android.text.format.Time;
-import android.util.Config;
 import android.util.Log;
 import android.util.TimeFormatException;
 import android.util.TimeUtils;
-import com.google.common.annotations.VisibleForTesting;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.TimeZone;
 
@@ -71,6 +72,8 @@ import java.util.TimeZone;
 public class CalendarProvider2 extends SQLiteContentProvider implements OnAccountsUpdateListener {
 
     private static final String TAG = "CalendarProvider2";
+
+    private static final String TIMEZONE_GMT = "GMT";
 
     private static final boolean PROFILE = false;
     private static final boolean MULTIPLE_ATTENDEES_PER_EVENT = true;
@@ -130,8 +133,7 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
 
     private CalendarDatabaseHelper mDbHelper;
 
-    private static final Uri SYNCSTATE_CONTENT_URI =
-            Uri.parse("content://syncstate/state");
+    private static final Uri SYNCSTATE_CONTENT_URI = Uri.parse("content://syncstate/state");
     //
     // SCHEDULE_ALARM_URI runs scheduleNextAlarm(false)
     // SCHEDULE_ALARM_REMOVE_URI runs scheduleNextAlarm(true)
@@ -143,10 +145,31 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
     /* package */ static final Uri SCHEDULE_ALARM_REMOVE_URI =
             Uri.withAppendedPath(Calendar.CONTENT_URI, SCHEDULE_ALARM_REMOVE_PATH);
 
+    // 5 second delay before updating alarms
+    private static final long ALARM_SCHEDULER_DELAY = 5000;
+
     // To determine if a recurrence exception originally overlapped the
     // window, we need to assume a maximum duration, since we only know
     // the original start time.
     private static final int MAX_ASSUMED_DURATION = 7*24*60*60*1000;
+
+    // The extended property name for storing an Event original Timezone.
+    // Due to an issue in Calendar Server restricting the length of the name we had to strip it down
+    // TODO - Better name would be:
+    // "com.android.providers.calendar.CalendarSyncAdapter#originalTimezone"
+    protected static final String EXT_PROP_ORIGINAL_TIMEZONE =
+        "CalendarSyncAdapter#originalTimezone";
+
+    private static final String SQL_SELECT_EVENTSRAWTIMES = "SELECT " +
+            EventsRawTimesColumns.EVENT_ID + ", " +
+            EventsRawTimesColumns.DTSTART_2445 + ", " +
+            EventsRawTimesColumns.DTEND_2445 + ", " +
+            Events.EVENT_TIMEZONE +
+            " FROM " +
+            "EventsRawTimes" + ", " +
+            "Events" +
+            " WHERE " +
+            EventsRawTimesColumns.EVENT_ID + " = " + "Events." + Events._ID;
 
     public static final class TimeRange {
         public long begin;
@@ -181,7 +204,8 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
     }
 
     // A thread that runs in the background and schedules the next
-    // calendar event alarm.
+    // calendar event alarm. It delays for 5 seconds before updating
+    // to aggregate further requests.
     private class AlarmScheduler extends Thread {
         boolean mRemoveAlarms;
 
@@ -191,14 +215,58 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
 
         @Override
         public void run() {
-            try {
-                Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
-                runScheduleNextAlarm(mRemoveAlarms);
-            } catch (SQLException e) {
-                Log.e(TAG, "runScheduleNextAlarm() failed", e);
+            Context context = CalendarProvider2.this.getContext();
+            // Because the handler does not guarantee message delivery in
+            // the case that the provider is killed, we need to make sure
+            // that the provider stays alive long enough to deliver the
+            // notification. This empty service is sufficient to "wedge" the
+            // process until we finish.
+            context.startService(new Intent(context, EmptyService.class));
+            while (true) {
+                // Wait a bit before writing to collect any other requests that
+                // may come in
+                try {
+                    sleep(ALARM_SCHEDULER_DELAY);
+                } catch (InterruptedException e1) {
+                    if(Log.isLoggable(TAG, Log.DEBUG)) {
+                        Log.d(TAG, "AlarmScheduler woke up early: " + e1.getMessage());
+                    }
+                }
+                // Clear any new requests and update whether or not we should
+                // remove alarms
+                synchronized (mAlarmLock) {
+                    mRemoveAlarms = mRemoveAlarms || mRemoveAlarmsOnRerun;
+                    mRerunAlarmScheduler = false;
+                    mRemoveAlarmsOnRerun = false;
+                }
+                // Run the update
+                try {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+                    runScheduleNextAlarm(mRemoveAlarms);
+                } catch (SQLException e) {
+                    if (Log.isLoggable(TAG, Log.ERROR)) {
+                        Log.e(TAG, "runScheduleNextAlarm() failed", e);
+                    }
+                }
+                // Check if anyone requested another alarm change while we were busy.
+                // if not clear everything out and exit.
+                synchronized (mAlarmLock) {
+                    if (!mRerunAlarmScheduler) {
+                        mAlarmScheduler = null;
+                        mRerunAlarmScheduler = false;
+                        mRemoveAlarmsOnRerun = false;
+                        context.stopService(new Intent(context, EmptyService.class));
+                        return;
+                    }
+                }
             }
         }
     }
+
+    private static AlarmScheduler mAlarmScheduler;
+
+    private static boolean mRerunAlarmScheduler = false;
+    private static boolean mRemoveAlarmsOnRerun = false;
 
     /**
      * We search backward in time for event reminders that we may have missed
@@ -357,7 +425,7 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
     /**
      * This creates a background thread to check the timezone and update
      * the timezone dependent fields in the Instances table if the timezone
-     * has changes.
+     * has changed.
      */
     protected void updateTimezoneDependentFields() {
         Thread thread = new TimezoneCheckerThread();
@@ -370,29 +438,48 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
             Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
             try {
                 doUpdateTimezoneDependentFields();
+                triggerAppWidgetUpdate(-1 /*changedEventId*/ );
             } catch (SQLException e) {
-                Log.e(TAG, "doUpdateTimezoneDependentFields() failed", e);
+                if (Log.isLoggable(TAG, Log.ERROR)) {
+                    Log.e(TAG, "doUpdateTimezoneDependentFields() failed", e);
+                }
                 try {
                     // Clear at least the in-memory data (and if possible the
                     // database fields) to force a re-computation of Instances.
                     mMetaData.clearInstanceRange();
                 } catch (SQLException e2) {
-                    Log.e(TAG, "clearInstanceRange() also failed: " + e2);
+                    if (Log.isLoggable(TAG, Log.ERROR)) {
+                        Log.e(TAG, "clearInstanceRange() also failed: " + e2);
+                    }
                 }
             }
         }
     }
 
     /**
-     * This method runs in a background thread.  If the timezone has changed
+     * Check if we are in the same time zone
+     */
+    private boolean isLocalSameAsInstancesTimezone() {
+        String localTimezone = TimeZone.getDefault().getID();
+        return TextUtils.equals(mCalendarCache.readTimezoneInstances(), localTimezone);
+    }
+
+    /**
+     * This method runs in a background thread.  If the timezone db or timezone has changed
      * then the Instances table will be regenerated.
      */
-    private void doUpdateTimezoneDependentFields() {
-        if (! isSameTimezoneDatabaseVersion()) {
-            doProcessEventRawTimes(null  /* default current timezone*/,
-            TimeUtils.getTimeZoneDatabaseVersion());
+    protected void doUpdateTimezoneDependentFields() {
+        String timezoneType = mCalendarCache.readTimezoneType();
+        // Nothing to do if we have the "home" timezone type (timezone is sticky)
+        if (timezoneType.equals(CalendarCache.TIMEZONE_TYPE_HOME)) {
+            return;
         }
-        if (isSameTimezone()) {
+        // We are here in "auto" mode, the timezone is coming from the device
+        if (! isSameTimezoneDatabaseVersion()) {
+            String localTimezone = TimeZone.getDefault().getID();
+            doProcessEventRawTimes(localTimezone, TimeUtils.getTimeZoneDatabaseVersion());
+        }
+        if (isLocalSameAsInstancesTimezone()) {
             // Even if the timezone hasn't changed, check for missed alarms.
             // This code executes when the CalendarProvider2 is created and
             // helps to catch missed alarms when the Calendar process is
@@ -401,7 +488,7 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
         }
     }
 
-    protected void doProcessEventRawTimes(String timezone, String timeZoneDatabaseVersion) {
+    protected void doProcessEventRawTimes(String localTimezone, String timeZoneDatabaseVersion) {
         mDb = mDbHelper.getWritableDatabase();
         if (mDb == null) {
             if (Log.isLoggable(TAG, Log.VERBOSE)) {
@@ -411,8 +498,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
         }
         mDb.beginTransaction();
         try {
-            updateEventsStartEndFromEventRawTimesLocked(timezone);
+            updateEventsStartEndFromEventRawTimesLocked();
             updateTimezoneDatabaseVersion(timeZoneDatabaseVersion);
+            mCalendarCache.writeTimezoneInstances(localTimezone);
             regenerateInstancesTable();
             mDb.setTransactionSuccessful();
         } finally {
@@ -420,24 +508,23 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
         }
     }
 
-    private void updateEventsStartEndFromEventRawTimesLocked(String timezone) {
-        Cursor cursor = mDb.query("EventsRawTimes",
-                            new String[] { EventsRawTimesColumns.EVENT_ID,
-                                    EventsRawTimesColumns.DTSTART_2445,
-                                    EventsRawTimesColumns.DTEND_2445} /* projection */,
-                            null /* selection */,
-                            null /* selection args */,
-                            null /* group by */,
-                            null /* having */,
-                            null /* order by */
-                );
+    private void updateEventsStartEndFromEventRawTimesLocked() {
+        Cursor cursor = mDb.rawQuery(SQL_SELECT_EVENTSRAWTIMES, null /* selection args */);
         try {
             while (cursor.moveToNext()) {
                 long eventId = cursor.getLong(0);
                 String dtStart2445 = cursor.getString(1);
                 String dtEnd2445 = cursor.getString(2);
+                String eventTimezone = cursor.getString(3);
+                if (dtStart2445 == null && dtEnd2445 == null) {
+                    if (Log.isLoggable(TAG, Log.ERROR)) {
+                        Log.e(TAG, "Event " + eventId + " has dtStart2445 and dtEnd2445 null "
+                                + "at the same time in EventsRawTimes!");
+                    }
+                    continue;
+                }
                 updateEventsStartEndLocked(eventId,
-                        timezone,
+                        eventTimezone,
                         dtStart2445,
                         dtEnd2445);
             }
@@ -449,14 +536,18 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
 
     private long get2445ToMillis(String timezone, String dt2445) {
         if (null == dt2445) {
-            Log.v( TAG, "Cannot parse null RFC2445 date");
+            if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                Log.v( TAG, "Cannot parse null RFC2445 date");
+            }
             return 0;
         }
         Time time = (timezone != null) ? new Time(timezone) : new Time();
         try {
             time.parse(dt2445);
         } catch (TimeFormatException e) {
-            Log.v( TAG, "Cannot parse RFC2445 date " + dt2445);
+            if (Log.isLoggable(TAG, Log.ERROR)) {
+                Log.e( TAG, "Cannot parse RFC2445 date " + dt2445);
+            }
             return 0;
         }
         return time.toMillis(true /* ignore DST */);
@@ -482,28 +573,18 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
         try {
             mCalendarCache.writeTimezoneDatabaseVersion(timeZoneDatabaseVersion);
         } catch (CalendarCache.CacheException e) {
-            Log.e(TAG, "Could not write timezone database version in the cache");
+            if (Log.isLoggable(TAG, Log.ERROR)) {
+                Log.e(TAG, "Could not write timezone database version in the cache");
+            }
         }
-    }
-
-    /**
-     * Check if we are in the same time zone
-     */
-    private boolean isSameTimezone() {
-        MetaData.Fields fields = mMetaData.getFields();
-        String localTimezone = TimeZone.getDefault().getID();
-        return TextUtils.equals(fields.timezone, localTimezone);
     }
 
     /**
      * Check if the time zone database version is the same as the cached one
      */
     protected boolean isSameTimezoneDatabaseVersion() {
-        String timezoneDatabaseVersion = null;
-        try {
-            timezoneDatabaseVersion = mCalendarCache.readTimezoneDatabaseVersion();
-        } catch (CalendarCache.CacheException e) {
-            Log.e(TAG, "Could not read timezone database version from the cache");
+        String timezoneDatabaseVersion = mCalendarCache.readTimezoneDatabaseVersion();
+        if (timezoneDatabaseVersion == null) {
             return false;
         }
         return TextUtils.equals(timezoneDatabaseVersion, TimeUtils.getTimeZoneDatabaseVersion());
@@ -511,15 +592,19 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
 
     @VisibleForTesting
     protected String getTimezoneDatabaseVersion() {
-        String timezoneDatabaseVersion = null;
-        try {
-            timezoneDatabaseVersion = mCalendarCache.readTimezoneDatabaseVersion();
-        } catch (CalendarCache.CacheException e) {
-            Log.e(TAG, "Could not read timezone database version from the cache");
+        String timezoneDatabaseVersion = mCalendarCache.readTimezoneDatabaseVersion();
+        if (timezoneDatabaseVersion == null) {
             return "";
         }
-        Log.i(TAG, "timezoneDatabaseVersion = " + timezoneDatabaseVersion);
+        if (Log.isLoggable(TAG, Log.INFO)) {
+            Log.i(TAG, "timezoneDatabaseVersion = " + timezoneDatabaseVersion);
+        }
         return timezoneDatabaseVersion;
+    }
+
+    private boolean isHomeTimezone() {
+        String type = mCalendarCache.readTimezoneType();
+        return type.equals(CalendarCache.TIMEZONE_TYPE_HOME);
     }
 
     private void regenerateInstancesTable() {
@@ -527,7 +612,8 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
         // Regenerate the Instances table for this month.  Include events
         // starting at the beginning of this month.
         long now = System.currentTimeMillis();
-        Time time = new Time();
+        String instancesTimezone = mCalendarCache.readTimezoneInstances();
+        Time time = new Time(instancesTimezone);
         time.set(now);
         time.monthDay = 1;
         time.hour = 0;
@@ -544,7 +630,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                     new String[] { Instances._ID },
                     null /* selection */, null /* sort */,
                     false /* searchByDayInsteadOfMillis */,
-                    true /* force Instances deletion and expansion */);
+                    true /* force Instances deletion and expansion */,
+                    instancesTimezone,
+                    isHomeTimezone());
         } finally {
             if (cursor != null) {
                 cursor.close();
@@ -595,6 +683,7 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
         SQLiteQueryBuilder qb = new SQLiteQueryBuilder();
         String groupBy = null;
         String limit = null; // Not currently implemented
+        String instancesTimezone;
 
         final int match = sUriMatcher.match(uri);
         switch (match) {
@@ -651,9 +740,11 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                     throw new IllegalArgumentException("Cannot parse end "
                             + uri.getPathSegments().get(3));
                 }
+                instancesTimezone = mCalendarCache.readTimezoneInstances();
                 return handleInstanceQuery(qb, begin, end, projection,
                         selection, sortOrder, match == INSTANCES_BY_DAY,
-                        false /* do not force Instances deletion and expansion */);
+                        false /* do not force Instances deletion and expansion */,
+                        instancesTimezone, isHomeTimezone());
             case EVENT_DAYS:
                 int startDay;
                 int endDay;
@@ -669,7 +760,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                     throw new IllegalArgumentException("Cannot parse end day "
                             + uri.getPathSegments().get(3));
                 }
-                return handleEventDayQuery(qb, startDay, endDay, projection, selection);
+                instancesTimezone = mCalendarCache.readTimezoneInstances();
+                return handleEventDayQuery(qb, startDay, endDay, projection, selection,
+                        instancesTimezone, isHomeTimezone());
             case ATTENDEES:
                 qb.setTables("Attendees, Events");
                 qb.setProjectionMap(sAttendeesProjectionMap);
@@ -718,6 +811,10 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                 selectionArgs = insertSelectionArg(selectionArgs, uri.getPathSegments().get(1));
                 qb.appendWhere("ExtendedProperties._id=?");
                 break;
+            case PROVIDER_PROPERTIES:
+                qb.setTables("CalendarCache");
+                qb.setProjectionMap(sCalendarCacheProjectionMap);
+                break;
             default:
                 throw new IllegalArgumentException("Unknown URL " + uri);
         }
@@ -759,11 +856,14 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
      * @param sort How to sort
      * @param searchByDay if true, range is in Julian days, if false, range is in ms
      * @param forceExpansion force the Instance deletion and expansion if set to true
+     * @param instancesTimezone timezone we need to use for computing the instances
+     * @param isHomeTimezone if true, we are in the "home" timezone
      * @return
      */
     private Cursor handleInstanceQuery(SQLiteQueryBuilder qb, long rangeBegin,
             long rangeEnd, String[] projection, String selection, String sort,
-            boolean searchByDay, boolean forceExpansion) {
+            boolean searchByDay, boolean forceExpansion, String instancesTimezone,
+            boolean isHomeTimezone) {
 
         qb.setTables("Instances INNER JOIN Events ON (Instances.event_id=Events._id) " +
                 "INNER JOIN Calendars ON (Events.calendar_id = Calendars._id)");
@@ -771,20 +871,20 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
         if (searchByDay) {
             // Convert the first and last Julian day range to a range that uses
             // UTC milliseconds.
-            Time time = new Time();
+            Time time = new Time(instancesTimezone);
             long beginMs = time.setJulianDay((int) rangeBegin);
             // We add one to lastDay because the time is set to 12am on the given
             // Julian day and we want to include all the events on the last day.
             long endMs = time.setJulianDay((int) rangeEnd + 1);
             // will lock the database.
-            acquireInstanceRange(beginMs, endMs,
-                    true /* use minimum expansion window */, forceExpansion
+            acquireInstanceRange(beginMs, endMs, true /* use minimum expansion window */,
+                    forceExpansion, instancesTimezone, isHomeTimezone
             );
             qb.appendWhere("startDay<=? AND endDay>=?");
         } else {
             // will lock the database.
-            acquireInstanceRange(rangeBegin, rangeEnd,
-                    true /* use minimum expansion window */, forceExpansion
+            acquireInstanceRange(rangeBegin, rangeEnd, true /* use minimum expansion window */,
+                    forceExpansion, instancesTimezone, isHomeTimezone
             );
             qb.appendWhere("begin<=? AND end>=?");
         }
@@ -795,19 +895,21 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
     }
 
     private Cursor handleEventDayQuery(SQLiteQueryBuilder qb, int begin, int end,
-            String[] projection, String selection) {
+            String[] projection, String selection, String instancesTimezone,
+            boolean isHomeTimezone) {
         qb.setTables("Instances INNER JOIN Events ON (Instances.event_id=Events._id) " +
                 "INNER JOIN Calendars ON (Events.calendar_id = Calendars._id)");
         qb.setProjectionMap(sInstancesProjectionMap);
         // Convert the first and last Julian day range to a range that uses
         // UTC milliseconds.
-        Time time = new Time();
+        Time time = new Time(instancesTimezone);
         long beginMs = time.setJulianDay(begin);
         // We add one to lastDay because the time is set to 12am on the given
         // Julian day and we want to include all the events on the last day.
         long endMs = time.setJulianDay(end + 1);
 
-        acquireInstanceRange(beginMs, endMs, true, false /* do not force Instances expansion */);
+        acquireInstanceRange(beginMs, endMs, true,
+                false /* do not force Instances expansion */, instancesTimezone, isHomeTimezone);
         qb.appendWhere("startDay<=? AND endDay>=?");
         String selectionArgs[] = new String[] {String.valueOf(end), String.valueOf(begin)};
 
@@ -823,12 +925,16 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
      * @param end end of range (ms)
      * @param useMinimumExpansionWindow expand by at least MINIMUM_EXPANSION_SPAN
      * @param forceExpansion force the Instance deletion and expansion if set to true
+     * @param instancesTimezone timezone we need to use for computing the instances
+     * @param isHomeTimezone if true, we are in the "home" timezone
      */
     private void acquireInstanceRange(final long begin, final long end,
-            final boolean useMinimumExpansionWindow, final boolean forceExpansion) {
+            final boolean useMinimumExpansionWindow, final boolean forceExpansion,
+            final String instancesTimezone, final boolean isHomeTimezone) {
         mDb.beginTransaction();
         try {
-            acquireInstanceRangeLocked(begin, end, useMinimumExpansionWindow, forceExpansion);
+            acquireInstanceRangeLocked(begin, end, useMinimumExpansionWindow,
+                    forceExpansion, instancesTimezone, isHomeTimezone);
             mDb.setTransactionSuccessful();
         } finally {
             mDb.endTransaction();
@@ -842,11 +948,22 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
      * @param begin start of range (ms)
      * @param end end of range (ms)
      * @param useMinimumExpansionWindow expand by at least MINIMUM_EXPANSION_SPAN
+     * @param forceExpansion force the Instance deletion and expansion if set to true
+     * @param instancesTimezone timezone we need to use for computing the instances
+     * @param isHomeTimezone if true, we are in the "home" timezone
      */
-    private void acquireInstanceRangeLocked(long begin, long end,
-            boolean useMinimumExpansionWindow, boolean forceExpansion) {
+    private void acquireInstanceRangeLocked(long begin, long end, boolean useMinimumExpansionWindow,
+            boolean forceExpansion, String instancesTimezone, boolean isHomeTimezone) {
         long expandBegin = begin;
         long expandEnd = end;
+
+        if (instancesTimezone == null) {
+            if (Log.isLoggable(TAG, Log.ERROR)) {
+                Log.e(TAG, "Cannot run acquireInstanceRangeLocked() "
+                        + "because instancesTimezone is null");
+            }
+            return;
+        }
 
         if (useMinimumExpansionWindow) {
             // if we end up having to expand events into the instances table, expand
@@ -864,22 +981,46 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
         // We do this check here because the database is locked and we can
         // safely delete all the entries in the Instances table.
         MetaData.Fields fields = mMetaData.getFieldsLocked();
-        String dbTimezone = fields.timezone;
         long maxInstance = fields.maxInstance;
         long minInstance = fields.minInstance;
-        String localTimezone = TimeZone.getDefault().getID();
-        boolean timezoneChanged = (dbTimezone == null) || !dbTimezone.equals(localTimezone);
-
+        boolean timezoneChanged;
+        if (isHomeTimezone) {
+            String previousTimezone = mCalendarCache.readTimezoneInstancesPrevious();
+            timezoneChanged = !instancesTimezone.equals(previousTimezone);
+        } else {
+            String localTimezone = TimeZone.getDefault().getID();
+            timezoneChanged = !instancesTimezone.equals(localTimezone);
+            // if we're in auto make sure we are using the device time zone
+            if (timezoneChanged) {
+                instancesTimezone = localTimezone;
+            }
+        }
+        // if "home", then timezoneChanged only if current != previous
+        // if "auto", then timezoneChanged, if !instancesTimezone.equals(localTimezone);
         if (maxInstance == 0 || timezoneChanged || forceExpansion) {
             // Empty the Instances table and expand from scratch.
             mDb.execSQL("DELETE FROM Instances;");
-            if (Config.LOGV) {
+            if (Log.isLoggable(TAG, Log.VERBOSE)) {
                 Log.v(TAG, "acquireInstanceRangeLocked() deleted Instances,"
                         + " timezone changed: " + timezoneChanged);
             }
-            expandInstanceRangeLocked(expandBegin, expandEnd, localTimezone);
+            expandInstanceRangeLocked(expandBegin, expandEnd, instancesTimezone);
 
-            mMetaData.writeLocked(localTimezone, expandBegin, expandEnd);
+            mMetaData.writeLocked(instancesTimezone, expandBegin, expandEnd);
+
+            String timezoneType = mCalendarCache.readTimezoneType();
+            // This may cause some double writes but guarantees the time zone in
+            // the db and the time zone the instances are in is the same, which
+            // future changes may affect.
+            mCalendarCache.writeTimezoneInstances(instancesTimezone);
+
+            // If we're in auto check if we need to fix the previous tz value
+            if (timezoneType.equals(CalendarCache.TIMEZONE_TYPE_AUTO)) {
+                String prevTZ = mCalendarCache.readTimezoneInstancesPrevious();
+                if (TextUtils.equals(TIMEZONE_GMT, prevTZ)) {
+                    mCalendarCache.writeTimezoneInstancesPrevious(instancesTimezone);
+                }
+            }
             return;
         }
 
@@ -895,7 +1036,7 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
         // always be expanding because there would always be one more day
         // or week that hasn't been expanded.
         if ((begin >= minInstance) && (end <= maxInstance)) {
-            if (Config.LOGV) {
+            if (Log.isLoggable(TAG, Log.VERBOSE)) {
                 Log.v(TAG, "Canceled instance query (" + expandBegin + ", " + expandEnd
                         + ") falls within previously expanded range.");
             }
@@ -905,19 +1046,19 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
         // If the requested begin point has not been expanded, then include
         // more events than requested in the expansion (use "expandBegin").
         if (begin < minInstance) {
-            expandInstanceRangeLocked(expandBegin, minInstance, localTimezone);
+            expandInstanceRangeLocked(expandBegin, minInstance, instancesTimezone);
             minInstance = expandBegin;
         }
 
         // If the requested end point has not been expanded, then include
         // more events than requested in the expansion (use "expandEnd").
         if (end > maxInstance) {
-            expandInstanceRangeLocked(maxInstance, expandEnd, localTimezone);
+            expandInstanceRangeLocked(maxInstance, expandEnd, instancesTimezone);
             maxInstance = expandEnd;
         }
 
-        // Update the bounds on the Instances table.
-        mMetaData.writeLocked(localTimezone, minInstance, maxInstance);
+        // Update the bounds on the Instances table (timezone is the same here)
+        mMetaData.writeLocked(instancesTimezone, minInstance, maxInstance);
     }
 
     private static final String[] EXPAND_COLUMNS = new String[] {
@@ -1087,8 +1228,10 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                         duration.parse(durationStr);
                     }
                     catch (DateException e) {
-                        Log.w(TAG, "error parsing duration for event "
-                                + eventId + "'" + durationStr + "'", e);
+                        if (Log.isLoggable(TAG, Log.WARN)) {
+                            Log.w(TAG, "error parsing duration for event "
+                                    + eventId + "'" + durationStr + "'", e);
+                        }
                         duration.sign = 1;
                         duration.weeks = 0;
                         duration.days = 0;
@@ -1120,7 +1263,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                 try {
                     recur = new RecurrenceSet(rruleStr, rdateStr, exruleStr, exdateStr);
                 } catch (EventRecurrence.InvalidFormatException e) {
-                    Log.w(TAG, "Could not parse RRULE recurrence string: " + rruleStr, e);
+                    if (Log.isLoggable(TAG, Log.WARN)) {
+                        Log.w(TAG, "Could not parse RRULE recurrence string: " + rruleStr, e);
+                    }
                     continue;
                 }
 
@@ -1129,8 +1274,10 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
 
                     if (status == Events.STATUS_CANCELED) {
                         // should not happen!
-                        Log.e(TAG, "Found canceled recurring event in "
-                                + "Events table.  Ignoring.");
+                        if (Log.isLoggable(TAG, Log.ERROR)) {
+                            Log.e(TAG, "Found canceled recurring event in "
+                                    + "Events table.  Ignoring.");
+                        }
                         continue;
                     }
 
@@ -1141,8 +1288,10 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
 
                     if (durationStr == null) {
                         // should not happen.
-                        Log.e(TAG, "Repeating event has no duration -- "
-                                + "should not happen.");
+                        if (Log.isLoggable(TAG, Log.ERROR)) {
+                            Log.e(TAG, "Repeating event has no duration -- "
+                                    + "should not happen.");
+                        }
                         if (allDay) {
                             // set to one day.
                             duration.sign = 1;
@@ -1232,7 +1381,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                         if (originalEvent != null && originalInstanceTimeMillis != -1) {
                             initialValues.put(Events.STATUS, Events.STATUS_CANCELED);
                         } else {
-                            Log.w(TAG, "Unexpected event outside window: " + syncId);
+                            if (Log.isLoggable(TAG, Log.WARN)) {
+                                Log.w(TAG, "Unexpected event outside window: " + syncId);
+                            }
                             continue;
                         }
                     }
@@ -1256,9 +1407,13 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                     instancesMap.add(syncIdKey, initialValues);
                 }
             } catch (DateException e) {
-                Log.w(TAG, "RecurrenceProcessor error ", e);
+                if (Log.isLoggable(TAG, Log.WARN)) {
+                    Log.w(TAG, "RecurrenceProcessor error ", e);
+                }
             } catch (TimeFormatException e) {
-                Log.w(TAG, "RecurrenceProcessor error ", e);
+                if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                    Log.w(TAG, "RecurrenceProcessor error ", e);
+                }
             }
         }
 
@@ -1419,6 +1574,8 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                 return "vnd.android.cursor.dir/event-instance";
             case TIME:
                 return "time/epoch";
+            case PROVIDER_PROPERTIES:
+                return "vnd.android.cursor.dir/property";
             default:
                 throw new IllegalArgumentException("Unknown URL " + url);
         }
@@ -1608,8 +1765,10 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                     }
                 }
                 if (fixAllDayTime(uri, updatedValues)) {
-                    Log.w(TAG, "insertInTransaction: " +
-                            "allDay is true but sec, min, hour were not 0.");
+                    if (Log.isLoggable(TAG, Log.WARN)) {
+                        Log.w(TAG, "insertInTransaction: " +
+                                "allDay is true but sec, min, hour were not 0.");
+                    }
                 }
                 id = mDbHelper.eventsInsert(updatedValues);
                 if (id != -1) {
@@ -1624,6 +1783,38 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                             owner = getOwner(updatedValues.getAsLong(Events.CALENDAR_ID));
                         }
                         createAttendeeEntry(id, status, owner);
+                    }
+                    // if the Event Timezone is defined, store it as the original one in the
+                    // ExtendedProperties table
+                    if (values.containsKey(Events.EVENT_TIMEZONE) && !callerIsSyncAdapter) {
+                        String originalTimezone = values.getAsString(Events.EVENT_TIMEZONE);
+
+                        ContentValues expropsValues = new ContentValues();
+                        expropsValues.put(Calendar.ExtendedProperties.EVENT_ID, id);
+                        expropsValues.put(Calendar.ExtendedProperties.NAME,
+                                EXT_PROP_ORIGINAL_TIMEZONE);
+                        expropsValues.put(Calendar.ExtendedProperties.VALUE, originalTimezone);
+
+                        // Insert the extended property
+                        long exPropId = mDbHelper.extendedPropertiesInsert(expropsValues);
+                        if (exPropId == -1) {
+                            if (Log.isLoggable(TAG, Log.ERROR)) {
+                                Log.e(TAG, "Cannot add the original Timezone in the "
+                                        + "ExtendedProperties table for Event: " + id);
+                            }
+                        } else {
+                            // Update the Event for saying it has some extended properties
+                            ContentValues eventValues = new ContentValues();
+                            eventValues.put(Events.HAS_EXTENDED_PROPERTIES, "1");
+                            int result = mDb.update("Events", eventValues, "_id=?",
+                                    new String[] {String.valueOf(id)});
+                            if (result <= 0) {
+                                if (Log.isLoggable(TAG, Log.ERROR)) {
+                                    Log.e(TAG, "Cannot update hasExtendedProperties column"
+                                            + " for Event: " + id);
+                                }
+                            }
+                        }
                     }
                     triggerAppWidgetUpdate(id);
                 }
@@ -1696,6 +1887,7 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
             case INSTANCES:
             case INSTANCES_BY_DAY:
             case EVENT_DAYS:
+            case PROVIDER_PROPERTIES:
                 throw new UnsupportedOperationException("Cannot insert into that URL: " + uri);
             default:
                 throw new IllegalArgumentException("Unknown URL " + uri);
@@ -1784,7 +1976,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
      */
     private String getOwner(long calId) {
         if (calId < 0) {
-            Log.e(TAG, "Calendar Id is not valid: " + calId);
+            if (Log.isLoggable(TAG, Log.ERROR)) {
+                Log.e(TAG, "Calendar Id is not valid: " + calId);
+            }
             return null;
         }
         // Get the email address of this user from this Calendar
@@ -1797,7 +1991,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                     null /* selectionArgs */,
                     null /* sort */);
             if (cursor == null || !cursor.moveToFirst()) {
-                Log.d(TAG, "Couldn't find " + calId + " in Calendars table");
+                if (Log.isLoggable(TAG, Log.DEBUG)) {
+                    Log.d(TAG, "Couldn't find " + calId + " in Calendars table");
+                }
                 return null;
             }
             emailAddress = cursor.getString(0);
@@ -1857,7 +2053,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                         null /* selectionArgs */,
                         null /* sort */);
                 if (cursor == null || !cursor.moveToFirst()) {
-                    Log.d(TAG, "Couldn't find " + eventId + " in Events table");
+                    if (Log.isLoggable(TAG, Log.DEBUG)) {
+                        Log.d(TAG, "Couldn't find " + eventId + " in Events table");
+                    }
                     return;
                 }
                 calId = cursor.getLong(0);
@@ -1877,7 +2075,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                         null /* selectionArgs */,
                         null /* sort */);
                 if (cursor == null || !cursor.moveToFirst()) {
-                    Log.d(TAG, "Couldn't find " + calId + " in Calendars table");
+                    if (Log.isLoggable(TAG, Log.DEBUG)) {
+                        Log.d(TAG, "Couldn't find " + calId + " in Calendars table");
+                    }
                     return;
                 }
                 calendarEmail = cursor.getString(0);
@@ -1946,8 +2146,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                 // must be present for a new event.
                 throw new RuntimeException("DTSTART missing.");
             }
-            if (Config.LOGV) Log.v(TAG, "Missing DTSTART.  "
-                    + "No need to update instance.");
+            if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                Log.v(TAG, "Missing DTSTART.  No need to update instance.");
+            }
             return;
         }
 
@@ -2067,8 +2268,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
             long rowId,
             SQLiteDatabase db) {
         MetaData.Fields fields = mMetaData.getFieldsLocked();
+        String instancesTimezone = mCalendarCache.readTimezoneInstances();
         String originalEvent = values.getAsString(Events.ORIGINAL_EVENT);
-        String recurrenceSyncId = null;
+        String recurrenceSyncId;
         if (originalEvent != null) {
             recurrenceSyncId = originalEvent;
         } else {
@@ -2103,16 +2305,13 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
         // Now do instance expansion
         Cursor entries = getRelevantRecurrenceEntries(recurrenceSyncId, rowId);
         try {
-            performInstanceExpansion(fields.minInstance, fields.maxInstance, fields.timezone,
+            performInstanceExpansion(fields.minInstance, fields.maxInstance, instancesTimezone,
                                      entries);
         } finally {
             if (entries != null) {
                 entries.close();
             }
         }
-
-        // Clear busy bits (is this still needed?)
-        mMetaData.writeLocked(fields.timezone, fields.minInstance, fields.maxInstance);
     }
 
     long calculateLastDate(ContentValues values)
@@ -2153,8 +2352,10 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
             try {
                 recur = new RecurrenceSet(values);
             } catch (EventRecurrence.InvalidFormatException e) {
-                Log.w(TAG, "Could not parse RRULE recurrence string: " +
-                        values.get(Calendar.Events.RRULE), e);
+                if (Log.isLoggable(TAG, Log.WARN)) {
+                    Log.w(TAG, "Could not parse RRULE recurrence string: " +
+                            values.get(Calendar.Events.RRULE), e);
+                }
                 return lastMillis; // -1
             }
 
@@ -2203,7 +2404,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
             return values;
         } catch (DateException e) {
             // don't add it if there was an error
-            Log.w(TAG, "Could not calculate last date.", e);
+            if (Log.isLoggable(TAG, Log.WARN)) {
+                Log.w(TAG, "Could not calculate last date.", e);
+            }
             return null;
         }
     }
@@ -2416,6 +2619,7 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
             case INSTANCES:
             case INSTANCES_BY_DAY:
             case EVENT_DAYS:
+            case PROVIDER_PROPERTIES:
                 throw new UnsupportedOperationException("Cannot delete that URL");
             default:
                 throw new IllegalArgumentException("Unknown URL " + uri);
@@ -2584,7 +2788,8 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                 readBooleanQueryParameter(uri, Calendar.CALLER_IS_SYNCADAPTER, false);
 
         // TODO: remove this restriction
-        if (!TextUtils.isEmpty(selection) && match != CALENDAR_ALERTS && match != EVENTS) {
+        if (!TextUtils.isEmpty(selection) && match != CALENDAR_ALERTS
+                && match != EVENTS && match != PROVIDER_PROPERTIES) {
             throw new IllegalArgumentException(
                     "WHERE based updates not supported");
         }
@@ -2617,6 +2822,12 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                 int result = mDb.update("Calendars", values, "_id=?",
                         new String[] {String.valueOf(id)});
 
+                // The calendar should not be displayed in widget either.
+                final Integer selected = values.getAsInteger(Calendars.SELECTED);
+                if (selected != null && selected == 0) {
+                    triggerAppWidgetUpdate(-1);
+                }
+
                 return result;
             }
             case EVENTS:
@@ -2634,8 +2845,10 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                         // Sync adapter Events operation affects just Events table, not associated
                         // tables.
                         if (fixAllDayTime(uri, values)) {
-                            Log.w(TAG, "updateInTransaction: Caller is sync adapter. " +
-                                    "allDay is true but sec, min, hour were not 0.");
+                            if (Log.isLoggable(TAG, Log.WARN)) {
+                                Log.w(TAG, "updateInTransaction: Caller is sync adapter. " +
+                                        "allDay is true but sec, min, hour were not 0.");
+                            }
                         }
                         return mDb.update("Events", values, selection, selectionArgs);
                     }
@@ -2665,7 +2878,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                 // TODO: should extend validateEventData to work with updates and call it here
                 updatedValues = updateLastDate(updatedValues);
                 if (updatedValues == null) {
-                    Log.w(TAG, "Could not update event.");
+                    if (Log.isLoggable(TAG, Log.WARN)) {
+                        Log.w(TAG, "Could not update event.");
+                    }
                     return 0;
                 }
                 // Make sure we pass in a uri with the id appended to fixAllDayTime
@@ -2676,8 +2891,10 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                     allDayUri = uri;
                 }
                 if (fixAllDayTime(allDayUri, updatedValues)) {
-                    Log.w(TAG, "updateInTransaction: " +
-                            "allDay is true but sec, min, hour were not 0.");
+                    if (Log.isLoggable(TAG, Log.WARN)) {
+                        Log.w(TAG, "updateInTransaction: " +
+                                "allDay is true but sec, min, hour were not 0.");
+                    }
                 }
 
                 int result = mDb.update("Events", updatedValues, "_id=?",
@@ -2774,6 +2991,80 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                 return 0;
             }
 
+            case PROVIDER_PROPERTIES: {
+                if (selection == null) {
+                    throw new UnsupportedOperationException("Selection cannot be null for " + uri);
+                }
+                if (!selection.equals("key=?")) {
+                    throw new UnsupportedOperationException("Selection should be key=? for " + uri);
+                }
+
+                List<String> list = Arrays.asList(selectionArgs);
+
+                if (list.contains(CalendarCache.KEY_TIMEZONE_INSTANCES_PREVIOUS)) {
+                    throw new UnsupportedOperationException("Invalid selection key: " +
+                            CalendarCache.KEY_TIMEZONE_INSTANCES_PREVIOUS + " for " + uri);
+                }
+
+                // Before it may be changed, save current Instances timezone for later use
+                String timezoneInstancesBeforeUpdate = mCalendarCache.readTimezoneInstances();
+
+                // Update the database with the provided values (this call may change the value
+                // of timezone Instances)
+                int result = mDb.update("CalendarCache", values, selection, selectionArgs);
+
+                // if successful, do some house cleaning:
+                // if the timezone type is set to "home", set the Instances timezone to the previous
+                // if the timezone type is set to "auto", set the Instances timezone to the current
+                //      device one
+                // if the timezone Instances is set AND if we are in "home" timezone type, then
+                //      save the timezone Instance into "previous" too
+                if (result > 0) {
+                    // If we are changing timezone type...
+                    if (list.contains(CalendarCache.KEY_TIMEZONE_TYPE)) {
+                        String value = values.getAsString(CalendarCache.COLUMN_NAME_VALUE);
+                        if (value != null) {
+                            // if we are setting timezone type to "home"
+                            if (value.equals(CalendarCache.TIMEZONE_TYPE_HOME)) {
+                                String previousTimezone =
+                                        mCalendarCache.readTimezoneInstancesPrevious();
+                                if (previousTimezone != null) {
+                                    mCalendarCache.writeTimezoneInstances(previousTimezone);
+                                }
+                                // Regenerate Instances if the "home" timezone has changed
+                                if (!timezoneInstancesBeforeUpdate.equals(previousTimezone) ) {
+                                    regenerateInstancesTable();
+                                }
+                            }
+                            // if we are setting timezone type to "auto"
+                            else if (value.equals(CalendarCache.TIMEZONE_TYPE_AUTO)) {
+                                String localTimezone = TimeZone.getDefault().getID();
+                                mCalendarCache.writeTimezoneInstances(localTimezone);
+                                if (!timezoneInstancesBeforeUpdate.equals(localTimezone)) {
+                                    regenerateInstancesTable();
+                                }
+                            }
+                        }
+                    }
+                    // If we are changing timezone Instances...
+                    else if (list.contains(CalendarCache.KEY_TIMEZONE_INSTANCES)) {
+                        // if we are in "home" timezone type...
+                        if (isHomeTimezone()) {
+                            String timezoneInstances = mCalendarCache.readTimezoneInstances();
+                            // Update the previous value
+                            mCalendarCache.writeTimezoneInstancesPrevious(timezoneInstances);
+                            // Recompute Instances if the "home" timezone has changed
+                            if (timezoneInstancesBeforeUpdate != null &&
+                                    !timezoneInstancesBeforeUpdate.equals(timezoneInstances)) {
+                                regenerateInstancesTable();
+                            }
+                        }
+                    }
+                    triggerAppWidgetUpdate(-1);
+                }
+                return result;
+            }
+
             default:
                 throw new IllegalArgumentException("Unknown URL " + uri);
         }
@@ -2840,8 +3131,10 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
 
         if (account == null) {
             // should not happen?
-            Log.w(TAG, "Cannot update subscription because account "
-                    + "is empty -- should not happen.");
+            if (Log.isLoggable(TAG, Log.WARN)) {
+                Log.w(TAG, "Cannot update subscription because account "
+                        + "is empty -- should not happen.");
+            }
             return;
         }
 
@@ -2891,7 +3184,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
             if (mAlarmManager == null) {
                 Context context = getContext();
                 if (context == null) {
-                    Log.e(TAG, "getAlarmManager() cannot get Context");
+                    if (Log.isLoggable(TAG, Log.ERROR)) {
+                        Log.e(TAG, "getAlarmManager() cannot get Context");
+                    }
                     return null;
                 }
                 Object service = context.getSystemService(Context.ALARM_SERVICE);
@@ -2904,7 +3199,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
     void scheduleNextAlarmCheck(long triggerTime) {
         AlarmManager manager = getAlarmManager();
         if (manager == null) {
-            Log.e(TAG, "scheduleNextAlarmCheck() cannot get AlarmManager");
+            if (Log.isLoggable(TAG, Log.ERROR)) {
+                Log.e(TAG, "scheduleNextAlarmCheck() cannot get AlarmManager");
+            }
             return;
         }
         Context context = getContext();
@@ -2933,8 +3230,17 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
      * This method runs the alarm scheduler in a background thread.
      */
     void scheduleNextAlarm(boolean removeAlarms) {
-        Thread thread = new AlarmScheduler(removeAlarms);
-        thread.start();
+        synchronized (mAlarmLock) {
+            if (mAlarmScheduler == null) {
+                mAlarmScheduler = new AlarmScheduler(removeAlarms);
+                mAlarmScheduler.start();
+            } else {
+                mRerunAlarmScheduler = true;
+                // removing the alarms is a stronger action so it has
+                // precedence.
+                mRemoveAlarmsOnRerun = mRemoveAlarmsOnRerun || removeAlarms;
+            }
+        }
     }
 
     /**
@@ -2984,7 +3290,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
     private void scheduleNextAlarmLocked(SQLiteDatabase db) {
         AlarmManager alarmManager = getAlarmManager();
         if (alarmManager == null) {
-            Log.e(TAG, "Failed to find the AlarmManager. Could not schedule the next alarm!");
+            if (Log.isLoggable(TAG, Log.ERROR)) {
+                Log.e(TAG, "Failed to find the AlarmManager. Could not schedule the next alarm!");
+            }
             return;
         }
 
@@ -3057,10 +3365,15 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
         String queryParams[] = new String[] {String.valueOf(start), String.valueOf(nextAlarmTime),
                 String.valueOf(currentMillis)};
 
+        String instancesTimezone = mCalendarCache.readTimezoneInstances();
+        boolean isHomeTimezone = mCalendarCache.readTimezoneType().equals(
+                CalendarCache.TIMEZONE_TYPE_HOME);
         acquireInstanceRangeLocked(start,
                 end,
                 false /* don't use minimum expansion windows */,
-                false /* do not force Instances deletion and expansion */);
+                false /* do not force Instances deletion and expansion */,
+                instancesTimezone,
+                isHomeTimezone);
         Cursor cursor = null;
         try {
             cursor = db.rawQuery(query, queryParams);
@@ -3131,7 +3444,10 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
                 Uri uri = CalendarAlerts.insert(cr, eventId, startTime,
                         endTime, alarmTime, minutes);
                 if (uri == null) {
-                    Log.e(TAG, "runScheduleNextAlarm() insert into CalendarAlerts table failed");
+                    if (Log.isLoggable(TAG, Log.ERROR)) {
+                        Log.e(TAG, "runScheduleNextAlarm() insert into "
+                                + "CalendarAlerts table failed");
+                    }
                     continue;
                 }
 
@@ -3214,6 +3530,7 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
     private static final int SCHEDULE_ALARM = 22;
     private static final int SCHEDULE_ALARM_REMOVE = 23;
     private static final int TIME = 24;
+    private static final int PROVIDER_PROPERTIES = 25;
 
     private static final UriMatcher sUriMatcher = new UriMatcher(UriMatcher.NO_MATCH);
     private static final HashMap<String, String> sInstancesProjectionMap;
@@ -3222,6 +3539,7 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
     private static final HashMap<String, String> sAttendeesProjectionMap;
     private static final HashMap<String, String> sRemindersProjectionMap;
     private static final HashMap<String, String> sCalendarAlertsProjectionMap;
+    private static final HashMap<String, String> sCalendarCacheProjectionMap;
 
     static {
         sUriMatcher.addURI(Calendar.AUTHORITY, "instances/when/*/*", INSTANCES);
@@ -3250,6 +3568,7 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
         sUriMatcher.addURI(Calendar.AUTHORITY, SCHEDULE_ALARM_REMOVE_PATH, SCHEDULE_ALARM_REMOVE);
         sUriMatcher.addURI(Calendar.AUTHORITY, "time/#", TIME);
         sUriMatcher.addURI(Calendar.AUTHORITY, "time", TIME);
+        sUriMatcher.addURI(Calendar.AUTHORITY, "properties", PROVIDER_PROPERTIES);
 
         sEventsProjectionMap = new HashMap<String, String>();
         // Events columns
@@ -3385,6 +3704,11 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
         sCalendarAlertsProjectionMap.put(CalendarAlerts.ALARM_TIME, "alarmTime");
         sCalendarAlertsProjectionMap.put(CalendarAlerts.STATE, "state");
         sCalendarAlertsProjectionMap.put(CalendarAlerts.MINUTES, "minutes");
+
+        // CalendarCache columns
+        sCalendarCacheProjectionMap = new HashMap<String, String>();
+        sCalendarCacheProjectionMap.put(CalendarCache.COLUMN_NAME_KEY, "key");
+        sCalendarCacheProjectionMap.put(CalendarCache.COLUMN_NAME_VALUE, "value");
     }
 
     /**
@@ -3428,7 +3752,9 @@ public class CalendarProvider2 extends SQLiteContentProvider implements OnAccoun
             }
 
             for (Account account : accountsToDelete) {
-                Log.d(TAG, "removing data for removed account " + account);
+                if (Log.isLoggable(TAG, Log.DEBUG)) {
+                    Log.d(TAG, "removing data for removed account " + account);
+                }
                 String[] params = new String[]{account.name, account.type};
                 mDb.execSQL("DELETE FROM Calendars"
                         + " WHERE " + CalendarDatabaseHelper.ACCOUNT_NAME + "= ? AND "
